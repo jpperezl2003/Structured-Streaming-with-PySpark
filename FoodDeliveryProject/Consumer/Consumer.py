@@ -30,10 +30,10 @@ from pymongo import MongoClient, UpdateOne
 KAFKA_BOOTSTRAP = "localhost:9092"
 KAFKA_TOPIC     = "food-delivery-events"
 
-MONGO_URI = "mongodb://localhost:27017"
+MONGO_URI = "mongodb://localhost:27017/?w=1"
 MONGO_DB  = "food_delivery"
 
-CHECKPOINT_BASE = "/tmp/checkpoints/food_delivery"
+CHECKPOINT_BASE = "C:/tmp/checkpoints/food_delivery"
 
 # ─────────────────────────────────────────────
 # Spark session
@@ -87,6 +87,15 @@ events = (
     .withColumn("event_time", to_timestamp(col("timestamp"), "yyyy-MM-dd HH:mm:ss"))
 )
 
+debug_parsed = (
+    events.writeStream
+    .format("console")
+    .outputMode("append")
+    .option("truncate", False)
+    .option("checkpointLocation", "C:/tmp/checkpoints/food_delivery/debug_parsed")
+    .start()
+)
+
 # ─────────────────────────────────────────────
 # Aggregations (the "core" of the pipeline)
 # ─────────────────────────────────────────────
@@ -130,15 +139,21 @@ payment_stats = (
 def upsert_to_mongo(collection_name: str, key_field: str):
     """Return a foreachBatch function that upserts each row into MongoDB."""
     def _writer(batch_df, batch_id):
-        if batch_df.rdd.isEmpty():
+        row_count = batch_df.count()
+        print(f"DEBUG {collection_name} batch={batch_id} rows={row_count}")
+
+        if row_count == 0:
+            print(f"DEBUG {collection_name} batch={batch_id} is empty, nothing to write.")
             return
 
         # Aggregations are small — collect to the driver as plain dicts
         records = [row.asDict(recursive=True) for row in batch_df.collect()]
+        print(f"DEBUG {collection_name} records={records}")
 
-        client = MongoClient(MONGO_URI, w="majority")  # write concern: majority
+        client = MongoClient(MONGO_URI)
         try:
             coll = client[MONGO_DB][collection_name]
+
             ops = [
                 UpdateOne(
                     {"_id": rec[key_field]},
@@ -146,16 +161,28 @@ def upsert_to_mongo(collection_name: str, key_field: str):
                     upsert=True,
                 )
                 for rec in records
+                if rec.get(key_field) is not None
             ]
+
+            if not ops:
+                print(f"DEBUG {collection_name} batch={batch_id} has no valid records to upsert.")
+                return
+
             result = coll.bulk_write(ops, ordered=False)
+
             print(
                 f"[{collection_name}] batch={batch_id} "
                 f"upserted={result.upserted_count} "
                 f"modified={result.modified_count} "
                 f"matched={result.matched_count}"
             )
+
+        except Exception as e:
+            print(f"ERROR writing to MongoDB collection {collection_name}: {e}")
+
         finally:
             client.close()
+
     return _writer
 
 # ─────────────────────────────────────────────
@@ -180,6 +207,8 @@ queries = [
         .option("checkpointLocation", f"{CHECKPOINT_BASE}/payment_stats")
         .start(),
 ]
+
+queries.append(debug_parsed)
 
 print("Streaming queries started. Press Ctrl+C to stop.")
 for q in queries:
